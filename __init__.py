@@ -137,6 +137,17 @@ class LLMChatNode:
         print(f"[ERROR] {error_result}")
         return error_result
 
+    def _check_fail_words(self, response: str, fail_words: str):
+        """Check if response contains any fail words. Returns (has_fail_word, fail_word) tuple."""
+        if not fail_words or not fail_words.strip():
+            return False, None
+        
+        fail_word_list = [word.strip() for word in fail_words.split() if word.strip()]
+        for fail_word in fail_word_list:
+            if fail_word.lower() in response.lower():
+                return True, fail_word
+        return False, None
+
     async def execute(self, mode, openai_base_url, api_key, openai_model, ollama_base_url, ollama_model, seed, max_retries, fail_words, system_prompt, user_prompt, image=None):
         img_base64 = None
         if image is not None:
@@ -176,8 +187,14 @@ class LLMChatNode:
                 url = f"{openai_base_url.rstrip('/')}/chat/completions"
                 raw_response = await self._call_api_async(session, url, headers, data, max_retries, "OpenAI")
                 
-                if "error" in raw_response.lower():
-                    print("[INFO] OpenAI failed. Smart Mode: Falling back to Ollama...")
+                # Check if OpenAI failed (either error or fail_words)
+                has_fail_word, fail_word = self._check_fail_words(raw_response, fail_words)
+                if "error" in raw_response.lower() or has_fail_word:
+                    if has_fail_word:
+                        print(f"[INFO] OpenAI response contains fail word '{fail_word}'. Smart Mode: Falling back to Ollama...")
+                    else:
+                        print("[INFO] OpenAI failed. Smart Mode: Falling back to Ollama...")
+                    
                     data = {"model": ollama_model, "messages": ollama_messages, "stream": False, "options": {"seed": seed}}
                     url = f"{ollama_base_url.rstrip('/')}/api/chat"
                     raw_response = await self._call_api_async(session, url, None, data, max_retries, "Ollama")
@@ -188,14 +205,14 @@ class LLMChatNode:
             print(f"[ERROR] API call failed with error response: {raw_response}")
             raise Exception(raw_response)
 
-        # Check for fail_words in the response
-        if fail_words and fail_words.strip():
-            fail_word_list = [word.strip() for word in fail_words.split() if word.strip()]
-            for fail_word in fail_word_list:
-                if fail_word.lower() in raw_response.lower():
-                    error_msg = f"Response contains fail word '{fail_word}'. Marking as failed.\nResponse: {raw_response}"
-                    print(f"[ERROR] {error_msg}")
-                    raise Exception(error_msg)
+        # Check for fail_words in the final response (for OpenAI and Ollama modes)
+        # In Smart mode, this was already checked and handled with fallback
+        if mode != "Smart":
+            has_fail_word, fail_word = self._check_fail_words(raw_response, fail_words)
+            if has_fail_word:
+                error_msg = f"Response contains fail word '{fail_word}'. Marking as failed.\nResponse: {raw_response}"
+                print(f"[ERROR] {error_msg}")
+                raise Exception(error_msg)
 
         # V3 Change: Parse the response and return three distinct outputs
         thinking, result = self._parse_response(raw_response)
