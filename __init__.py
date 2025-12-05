@@ -51,6 +51,7 @@ class LLMChatNode:
                 "ollama_model": (instance.ollama_models,),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "max_retries": ("INT", {"default": 3, "min": 1, "max": 10}),
+                "fail_words": ("STRING", {"default": "", "multiline": False}),
                 "system_prompt": ("STRING", {"default": "You are an image description generation expert. Your description is in natural language, no markdown or any other format. You output the description directly, no explanation. If you need to think, use <think>your thoughts here</think> tags.", "multiline": True}),
                 "user_prompt": ("STRING", {"default": "Describe the image.", "multiline": True}),
             },
@@ -95,14 +96,20 @@ class LLMChatNode:
 
     async def _call_api_async(self, session, url, headers, data, max_retries, service_name):
         last_exception = None
+        last_error_details = None
+        # Increase timeout for batch image processing
+        timeout = aiohttp.ClientTimeout(total=180)  # 3 minutes for large images or batch processing
         for attempt in range(max_retries):
+            response_text = None
             try:
-                async with session.post(url, headers=headers, json=data, timeout=60) as response: # Increased timeout
+                async with session.post(url, headers=headers, json=data, timeout=timeout) as response:
+                    response_text = await response.text()  # Get raw response first
                     response.raise_for_status()
                     response_json = await response.json()
                     
                     if service_name == "OpenAI":
                         if "choices" not in response_json or not response_json["choices"]:
+                            print(f"[ERROR] OpenAI Raw Response: {response_text}")
                             raise KeyError("API response is missing 'choices' field or it's empty.")
                         return response_json["choices"][0]["message"]["content"]
                     elif service_name == "Ollama":
@@ -110,20 +117,27 @@ class LLMChatNode:
                     
             except Exception as e:
                 last_exception = e
-                print(f"{service_name} Attempt {attempt + 1}/{max_retries} failed: {e}")
-                if isinstance(e, aiohttp.ClientResponseError):
-                     try:
-                        error_text = await response.text()
-                        print(f"Full API Error Response: {error_text}")
-                     except:
-                        pass
+                error_type = type(e).__name__
+                error_msg = str(e)
+                print(f"[ERROR] {service_name} Attempt {attempt + 1}/{max_retries} failed")
+                print(f"[ERROR] Error Type: {error_type}")
+                print(f"[ERROR] Error Message: {error_msg}")
+                
+                # Always try to print the raw API response
+                if response_text:
+                    print(f"[ERROR] {service_name} Raw API Response: {response_text}")
+                    last_error_details = f"{error_type}: {error_msg}\nRaw API Response: {response_text}"
+                else:
+                    last_error_details = f"{error_type}: {error_msg}"
                 
                 if attempt < max_retries - 1:
                     await asyncio.sleep(1)
 
-        return f"Error: {service_name} failed after {max_retries} retries. Last error: {last_exception}"
+        error_result = f"Error: {service_name} failed after {max_retries} retries.\nLast Error Details:\n{last_error_details if last_error_details else str(last_exception)}"
+        print(f"[ERROR] {error_result}")
+        return error_result
 
-    async def execute(self, mode, openai_base_url, api_key, openai_model, ollama_base_url, ollama_model, seed, max_retries, system_prompt, user_prompt, image=None):
+    async def execute(self, mode, openai_base_url, api_key, openai_model, ollama_base_url, ollama_model, seed, max_retries, fail_words, system_prompt, user_prompt, image=None):
         img_base64 = None
         if image is not None:
             try:
@@ -163,13 +177,25 @@ class LLMChatNode:
                 raw_response = await self._call_api_async(session, url, headers, data, max_retries, "OpenAI")
                 
                 if "error" in raw_response.lower():
-                    print("OpenAI failed. Smart Mode: Falling back to Ollama...")
+                    print("[INFO] OpenAI failed. Smart Mode: Falling back to Ollama...")
                     data = {"model": ollama_model, "messages": ollama_messages, "stream": False, "options": {"seed": seed}}
                     url = f"{ollama_base_url.rstrip('/')}/api/chat"
                     raw_response = await self._call_api_async(session, url, None, data, max_retries, "Ollama")
+                    if "error" in raw_response.lower():
+                        print(f"[ERROR] Ollama also failed: {raw_response}")
 
         if "error" in raw_response.lower():
+            print(f"[ERROR] API call failed with error response: {raw_response}")
             raise Exception(raw_response)
+
+        # Check for fail_words in the response
+        if fail_words and fail_words.strip():
+            fail_word_list = [word.strip() for word in fail_words.split() if word.strip()]
+            for fail_word in fail_word_list:
+                if fail_word.lower() in raw_response.lower():
+                    error_msg = f"Response contains fail word '{fail_word}'. Marking as failed.\nResponse: {raw_response}"
+                    print(f"[ERROR] {error_msg}")
+                    raise Exception(error_msg)
 
         # V3 Change: Parse the response and return three distinct outputs
         thinking, result = self._parse_response(raw_response)
