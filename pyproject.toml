@@ -29,7 +29,7 @@ Documentation = "https://github.com/Zeknes/Comfyui-LLM-Chat/wiki"
 "Bug Tracker" = "https://github.com/Zeknes/Comfyui-LLM-Chat/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "zeknes"
 DisplayName = "Comfyui-LLM-Chat"
 Icon = ""
 includes = [] 
